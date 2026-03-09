@@ -12,6 +12,10 @@ resource "aws_ecr_repository" "django_api" {
   # traceability, but more complex to manage while learning.
   image_tag_mutability = "MUTABLE"
 
+  # Allow `terraform destroy` to delete the repo even if it contains images.
+  # For production, remove this so you can't accidentally wipe your image history.
+  force_delete = true
+
   # Scan images for known OS/package vulnerabilities on every push.
   # Results show up in the ECR console. Free, always worth enabling.
   image_scanning_configuration {

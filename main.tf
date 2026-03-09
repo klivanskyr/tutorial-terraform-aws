@@ -20,6 +20,10 @@ provider "aws" {
 resource "aws_s3_bucket" "static_site" {
   bucket = "terraform-test.deepfeat.ai"
 
+  # Allow `terraform destroy` to delete the bucket even if it has objects in it.
+  # For production, remove this so you can't accidentally wipe your static files.
+  force_destroy = true
+
   tags = {
     Name        = "terraform-test-static-site"
     Project     = "terraform-tutorial"
