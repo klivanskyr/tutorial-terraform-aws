@@ -1,129 +1,142 @@
-# Network Security Overview
+# Security Architecture
 
-## Architecture
+## Network Diagram
 
 ```
 Internet
-    │
-    ▼
-┌─────────────────────────────────────────────────────────────┐
-│  Cloudflare DNS (grey cloud — DNS only, not proxied)        │
-└─────────────────────────────────────────────────────────────┘
-    │
-    ▼ HTTPS (TLS 1.2+)
-┌─────────────────────────────────────────────────────────────┐
-│  AWS CloudFront                                             │
-│  • ACM certificate (us-east-1)                              │
-│  • redirect-to-https enforced                               │
-│  • /api/*   → ALB (HTTP, within AWS network)               │
-│  • /admin*  → ALB (HTTP, within AWS network)               │
-│  • /*       → S3 static site                               │
-└─────────────────────────────────────────────────────────────┘
-    │                          │
-    ▼ HTTP (port 80)           ▼ HTTP (port 80, S3 website endpoint)
-┌──────────────┐         ┌──────────────────────────────────┐
-│  ALB         │         │  S3 (public read, static files)  │
-│  public      │         └──────────────────────────────────┘
-│  subnets     │
-│  SG: alb     │
-└──────────────┘
-    │
-    ▼ HTTP (port 8000)
-┌─────────────────────────────────────────────────────────────┐
-│  ECS Fargate (private subnets, no public IP)                │
-│  SG: ecs — only accepts traffic from SG: alb                │
-│  Outbound via NAT Gateway                                   │
-└─────────────────────────────────────────────────────────────┘
-    │                          │
-    ▼ port 5432                ▼ port 6379
-┌──────────────┐         ┌──────────────────┐
-│  RDS Proxy   │         │  ElastiCache     │
-│  private     │         │  Redis           │
-│  SG: rds-    │         │  private subnets │
-│  proxy       │         │  SG: redis       │
-└──────────────┘         └──────────────────┘
-    │
-    ▼ port 5432
-┌──────────────┐
-│  RDS         │
-│  Postgres    │
-│  private     │
-│  SG: rds     │
-└──────────────┘
+   │
+   │ HTTPS (TLS 1.2+)
+   ▼
+┌─────────────────────────────────────────────────────┐
+│  CloudFront (CDN + TLS termination)                 │
+│  - ACM cert (us-east-1) for terraform-test.deepfeat │
+│  - redirect-to-https on all behaviors               │
+│  - /api/* and /admin* → ALB (no caching)            │
+│  - /* (default) → S3 (static files, cached)         │
+└────────────┬───────────────────────┬────────────────┘
+             │ HTTP (within AWS)     │ HTTP (within AWS)
+             ▼                       ▼
+      ┌────────────┐         ┌──────────────────┐
+      │    ALB     │         │  S3 Static Site  │
+      │ (public    │         │  (index.html,    │
+      │  subnets)  │         │   /static/ files)│
+      └─────┬──────┘         └──────────────────┘
+            │ HTTP :8000
+            │ (private subnet, security group)
+            ▼
+   ┌─────────────────────┐
+   │   ECS Fargate Task  │  (private subnet, no public IP)
+   │   Django + Gunicorn │
+   │   port 8000         │
+   └────┬──────────┬─────┘
+        │          │
+        │ TLS      │ plaintext
+        ▼          ▼
+ ┌──────────┐  ┌──────────────┐
+ │ RDS      │  │  ElastiCache │
+ │ Proxy    │  │  Redis       │
+ │ (private)│  │  (private)   │
+ └────┬─────┘  └──────────────┘
+      │ TLS (require_tls=true)
+      ▼
+ ┌──────────┐
+ │ RDS      │
+ │ Postgres │
+ │ (private,│
+ │ encrypted│
+ │ at rest) │
+ └──────────┘
 ```
 
 ---
 
-## What Is Protected and How
+## Security Controls by Layer
 
-### 1. Network Perimeter
+### 1. TLS / Encryption in Transit
 
-**VPC with private/public subnet split**
-- ECS, RDS, RDS Proxy, and Redis all live in private subnets with no public IP
-- Only the ALB and NAT Gateway are in public subnets
-- Private subnets route outbound traffic through the NAT Gateway — they can initiate connections to the internet but nothing can initiate a connection back to them
+| Segment | Protocol | Notes |
+|---|---|---|
+| Visitor → CloudFront | HTTPS, TLS 1.2+ | ACM cert, SNI-only |
+| CloudFront → ALB | HTTP | Traffic never leaves AWS private network |
+| CloudFront → S3 | HTTP | S3 website endpoint is HTTP-only |
+| ALB → ECS | HTTP :8000 | Same VPC, no public path |
+| ECS → RDS Proxy | TLS | `require_tls = true` on the proxy |
+| RDS Proxy → RDS | TLS | AWS-managed, automatic |
+| ECS → Redis | **No TLS** | Plaintext within VPC — see weak spots |
 
-**Security groups follow least-privilege**
-- `alb`: accepts port 80/443 from the internet
-- `ecs`: accepts port 8000 from `alb` SG only — not from any IP range
-- `rds-proxy`: accepts port 5432 from `ecs` SG only
-- `rds`: accepts port 5432 from `rds-proxy` SG only
-- `redis`: accepts port 6379 from `ecs` SG only
+The CloudFront→ALB and CloudFront→S3 legs being HTTP is a deliberate, widely-accepted tradeoff. That traffic travels over AWS's internal network backbone, never the public internet.
 
-Using security group references (rather than CIDR ranges) means "any resource with the `alb` SG attached" — this is tighter than an IP range because it can't be accidentally broadened.
+### 2. Network Isolation (VPC + Security Groups)
 
-### 2. TLS / Encryption in Transit
+Every resource uses least-privilege security group rules — no resource accepts traffic from "anywhere" except the ALB (which must face the internet).
 
-**Visitor → CloudFront**: TLS 1.2+ enforced, ACM certificate, HTTP automatically redirected to HTTPS.
+```
+Internet → ALB SG (ports 80, 443)
+ALB SG   → ECS SG (port 8000 only, via security group reference)
+ECS SG   → RDS Proxy SG (port 5432 only)
+ECS SG   → Redis SG (port 6379 only)
+RDS Proxy SG → RDS SG (port 5432 only)
+```
 
-**CloudFront → S3**: HTTP only (S3 website endpoint doesn't support HTTPS). Content is public static files — no sensitive data.
+- ECS tasks have **no public IP** (`assign_public_ip = false`)
+- RDS, RDS Proxy, and Redis all live in **private subnets** with no internet gateway route
+- Outbound internet from ECS goes through a **NAT Gateway** (private → NAT in public subnet → IGW)
+- The NAT Gateway is the only way ECS can reach the internet; it is not reachable inbound
 
-**CloudFront → ALB**: HTTP on port 80, within AWS's private backbone. Traffic never leaves AWS infrastructure. This is a common and accepted pattern but is not encrypted.
+### 3. Authentication
 
-**ALB → ECS**: HTTP on port 8000 inside the VPC. Same as above.
+**API authentication (JWT + HttpOnly cookies)**
+- JWTs stored in HttpOnly cookies — JavaScript cannot read them (XSS protection)
+- `Secure=True, SameSite=Lax` cookie flags prevent cross-site transmission
+- Access token: 1-day lifetime
+- Refresh token: 7-day lifetime with rotation — each use issues a new token
+- Old refresh tokens are blacklisted in Postgres after rotation (`BLACKLIST_AFTER_ROTATION=True`)
+- All API endpoints require authentication by default (`DEFAULT_PERMISSION_CLASSES = [IsAuthenticated]`)
+- Public endpoints explicitly opt out with `permission_classes = [AllowAny]`
+- CSRF protection is active (Django default) — required for admin form posts
 
-**ECS → RDS Proxy → RDS**: Unencrypted by default. RDS supports TLS but it is not configured here.
-
-**ECS → Redis**: Unencrypted. ElastiCache supports TLS (`transit_encryption_enabled`) but it is not configured here.
-
-### 3. Authentication and Authorisation
-
-**JWT via HttpOnly cookies**
-- Access token (1 day) and refresh token (7 days) are stored as `HttpOnly; Secure; SameSite=Lax` cookies
-- `HttpOnly`: JavaScript cannot read the tokens — XSS attacks cannot steal them
-- `Secure`: cookies are only sent over HTTPS
-- `SameSite=Lax`: cookies are not sent on cross-site POST requests — CSRF protection at the browser level
-- Refresh token rotation: on every refresh the old token is blacklisted and a new one is issued
-- Logout blacklists the refresh token in the database so it cannot be reused even if captured
-
-**Default-deny authorisation**
-- `DEFAULT_PERMISSION_CLASSES = [IsAuthenticated]` means every endpoint requires auth unless explicitly opted out
-- Only `health`, `auth/login`, `auth/refresh`, and `auth/logout` are public
-
-**CSRF**
-- `CSRF_TRUSTED_ORIGINS` set to the production domain — admin form submissions from other origins are rejected
-- `SECURE_PROXY_SSL_HEADER` set so Django correctly identifies requests as HTTPS despite the HTTP ALB→ECS leg
+**Django admin authentication**
+- Session-based (Django's built-in admin auth)
+- Superuser password auto-generated (24 chars, `random_password` resource) and stored in AWS Secrets Manager
+- Password never appears in code or Terraform state as plaintext (it's in `random_password.result`)
+- Credentials retrieved via: `aws secretsmanager get-secret-value --secret-id django-api/superuser-credentials`
 
 ### 4. Secrets Management
 
-All secrets are stored in AWS Secrets Manager and injected at container startup — never in environment files, git, or Docker images:
+All sensitive values are stored in AWS Secrets Manager — nothing is hardcoded:
 
-| Secret | Path | What it holds |
-|--------|------|----------------|
-| DB credentials | `django-api/db-credentials` | RDS username + password |
-| Django secret key | `django-api/secret-key` | Used for signing sessions and tokens |
-| Superuser credentials | `django-api/superuser-credentials` | Admin portal login |
+| Secret | Path | Used by |
+|---|---|---|
+| DB credentials | `django-api/db-credentials` | RDS Proxy + ECS task |
+| Django SECRET_KEY | `django-api/secret-key` | ECS task |
+| Superuser password | `django-api/superuser-credentials` | ECS task (startup) |
 
-The ECS execution role has `secretsmanager:GetSecretValue` for exactly these three ARNs — nothing else.
-
-The ECS task role (what the running Django code uses) has no Secrets Manager access — it only has SSM permissions for `execute-command` debugging.
+- ECS execution role has IAM permission scoped to **only these three secrets** (not `*`)
+- RDS Proxy role has IAM permission scoped to **only the DB secret**
+- Secrets are injected as environment variables at container start — the app never fetches them at runtime
 
 ### 5. Database
 
-**RDS Proxy sits between ECS and RDS**
-- The app connects to the proxy endpoint, not directly to RDS
-- The proxy authenticates to RDS using the Secrets Manager credentials — the Django container never holds the real DB password in a persistent way
-- Connection pooling prevents connection exhaustion under load
+- RDS Postgres in private subnets, unreachable from the internet
+- Storage encrypted at rest (AWS-managed keys)
+- ECS connects to RDS **via the proxy**, never directly to the RDS instance
+- RDS Proxy provides connection pooling (prevents connection exhaustion under load)
+- `require_tls = true` on the proxy — all ECS↔Proxy traffic is encrypted
+- DB password is 32 chars, generated by Terraform, never hardcoded
+
+### 6. IAM (Least Privilege)
+
+Two distinct IAM roles for ECS:
+
+- **Execution role**: Used by the ECS control plane to pull images, write logs, fetch secrets. Managed policy `AmazonECSTaskExecutionRolePolicy` + inline policy for the three secrets.
+- **Task role**: Used by running Django code. Only has SSM permissions for `aws ecs execute-command` (no S3, no DynamoDB, no SNS etc.)
+
+### 7. Static Files
+
+- Django admin static files served from S3 at `/static/`, not from the application server
+- S3 bucket is publicly readable (required for static site hosting)
+- Static files are extracted from the Docker image at deploy time and synced via `aws s3 sync --delete`
+- No Gunicorn overhead for static file requests
 
 ---
 
@@ -132,94 +145,82 @@ The ECS task role (what the running Django code uses) has no Secrets Manager acc
 ### High Priority
 
 **`ALLOWED_HOSTS = "*"`**
-Django accepts any `Host` header. The correct fix is to set this to `terraform-test.deepfeat.ai` and configure the ALB health check to send a specific `Host` header (using the ALB `host_header` condition), so the health check still passes. As-is, a malicious request with a spoofed `Host` header would not be rejected.
+The ECS task definition sets `ALLOWED_HOSTS=*`. This means Django accepts requests with any Host header, which allows Host header injection attacks. The reason it's `*` is that ALB health checks send the private task IP as the Host header (e.g. `10.0.10.5:8000`), and we'd need to whitelist that dynamically or configure a fixed health check hostname on the ALB.
+*Fix*: Set a custom `Host` header on the ALB health check rule, then set `ALLOWED_HOSTS=terraform-test.deepfeat.ai`.
 
 **No WAF (Web Application Firewall)**
-There is no AWS WAF attached to CloudFront or the ALB. Common attacks — SQL injection, XSS, path traversal, large payload floods — are not filtered at the edge. AWS WAF can be attached to CloudFront with managed rule sets and costs ~$5/month plus per-request fees.
+There is no AWS WAF attached to CloudFront or the ALB. Common attacks (SQL injection, XSS, bad bots, rate limiting) are not blocked at the edge.
+*Fix*: Attach AWS WAF with the AWS managed rule groups to the CloudFront distribution.
 
-**No rate limiting on auth endpoints**
-`POST /api/auth/login` has no brute-force protection. An attacker can attempt unlimited password guesses. Fix: add `django-ratelimit` (uses Redis, which is already present) to limit login attempts per IP.
+**No login rate limiting**
+`/api/auth/login` has no brute-force protection. An attacker can try passwords indefinitely.
+*Fix*: Add `django-ratelimit` or a cache-based throttle to the login view.
 
-**Django admin is publicly reachable**
-`/admin/` is accessible from any IP on the internet. Automated scanners will find it and attempt credential stuffing. Fix options:
-- Restrict by IP using a CloudFront geo/IP restriction or WAF rule
-- Move to a non-standard URL (e.g., `path('internal-ops/', admin.site.urls)`)
-- Require VPN before CloudFront routes the request
-
-**Access token lifetime is 1 day**
-If an access token cookie is somehow extracted (e.g., via a compromised browser extension), it is valid for 24 hours. Typical production systems use 15 minutes. The refresh token handles keeping users logged in silently. Reducing access token lifetime to 15 minutes would limit the blast radius of a token compromise with minimal UX impact.
+**Admin panel publicly reachable**
+`/admin*` is reachable from any IP on the internet via CloudFront. Anyone can attempt to log in.
+*Fix*: Add a CloudFront geo-restriction or IP allowlist, or move admin behind a VPN/bastion.
 
 ### Medium Priority
 
-**No TLS between ECS and Redis**
-ElastiCache Redis is inside the VPC with security group restrictions, so it is not reachable from the internet. However, traffic is unencrypted inside the VPC. Add `transit_encryption_enabled = true` to the ElastiCache cluster and update the Django Redis URL to use `rediss://` (TLS scheme).
+**No Redis authentication or TLS**
+Redis has no password (`AUTH` disabled) and no TLS. Anyone who gets into the VPC — a compromised ECS task, a misconfigured security group — can read or write the cache freely.
+*Fix*: Enable ElastiCache in-transit encryption and set an auth token. Use `rediss://` URL in Django.
 
-**No TLS between ECS and RDS**
-Same situation. RDS supports TLS; the Django DB connection can be forced to require it with `'OPTIONS': {'sslmode': 'require'}`.
+**ALB is internet-facing**
+The ALB is `internal = false`, which means it has a public IP and DNS name. Only CloudFront should be sending it traffic, but the ALB itself has no restriction that enforces this — it accepts traffic from any IP.
+*Fix*: Add an ALB listener rule that only allows traffic from CloudFront IP ranges (AWS publishes these), or restrict the ALB security group to CloudFront prefix lists.
 
-**No Redis authentication**
-The ElastiCache cluster has no `auth_token`. Any ECS task (or future service) with the `ecs` security group attached can read and write the Redis cache freely. Add `auth_token` to the ElastiCache cluster and the `REDIS_URL`.
+**1-day access token lifetime**
+If an access token is stolen (e.g. via a compromised device, a log that leaks the cookie value), the attacker has up to 24 hours before it expires. There is no mechanism to revoke access tokens before expiry.
+*Fix*: Shorten access token lifetime to 15 minutes. The refresh flow is transparent to the browser.
 
-**`createsuperuser` CMD operator precedence bug**
-The current Dockerfile CMD:
+**Dockerfile CMD operator precedence bug**
+The container startup command is:
 ```
-migrate --noinput && createsuperuser --noinput || true && gunicorn
+python manage.py migrate --noinput && python manage.py createsuperuser --noinput || true && gunicorn ...
 ```
-Due to shell precedence this evaluates as:
-```
-((migrate && createsuperuser) || true) && gunicorn
-```
-If `migrate` **fails**, the `|| true` still makes the expression succeed and gunicorn starts — running against an unmigrated database. Fix:
-```
-migrate --noinput && (createsuperuser --noinput || true) && gunicorn
-```
-
-**Single NAT Gateway**
-Both private subnets route through one NAT Gateway in `us-west-1a`. If that AZ has an outage, ECS tasks in `us-west-1c` lose outbound internet access (ECR pulls, Secrets Manager, CloudWatch logs). Production setups put a NAT Gateway in each AZ.
-
-**Single ECS task (`desired_count = 1`)**
-One task means one AZ failure or one bad deployment takes the service down entirely. Increasing to 2 tasks across both AZs provides redundancy.
+Due to shell operator precedence (`||` binds before `&&` on the right), `|| true` applies to the entire chain. If `migrate` fails, `createsuperuser` is skipped but Gunicorn still starts — serving an unmigrated database.
+*Fix*: Use explicit grouping: `(migrate && createsuperuser || true) && gunicorn ...`
 
 ### Low Priority
 
-**CloudFront → S3 over HTTP**
-The S3 website endpoint only speaks HTTP. This is acceptable for a public static site — the content is not sensitive. To enforce HTTPS, switch from the S3 website endpoint to an S3 REST endpoint with an OAC (Origin Access Control), which supports HTTPS and also makes the bucket private.
+**Single NAT Gateway**
+There is one NAT Gateway in `us-west-1a`. If that AZ goes down, ECS tasks in `us-west-1c` lose internet access (can't reach ECR, Secrets Manager, CloudWatch).
+*Fix*: Add a second NAT Gateway in `us-west-1c` and add an AZ-specific private route table.
 
-**No CloudFront access logging**
-No record of who is hitting what paths, which makes detecting attack patterns (scanning, scraping, credential stuffing) impossible after the fact. Enable CloudFront access logs to S3.
+**Single ECS task**
+`desired_count = 1`. If the task crashes, there's a window of downtime while ECS replaces it.
+*Fix*: Set `desired_count = 2` and enable multi-AZ deployment.
 
-**Short CloudWatch log retention (7 days)**
-Forensic investigations often need weeks of logs. Increase to 30–90 days or ship logs to S3 for long-term storage.
+**Backup retention is 1 day**
+RDS automated backups are kept for only 1 day. If data is corrupted or accidentally deleted, you have a very narrow recovery window.
+*Fix*: Set `backup_retention_period = 7` (or more) in production.
 
-**No GuardDuty**
-AWS GuardDuty monitors API calls, network flows, and DNS queries for anomalous behaviour (e.g., a compromised ECS task making unusual outbound connections). It costs a small amount per GB of logs analysed and would be the first signal of a runtime compromise.
-
-**S3 bucket is fully public**
-The static site bucket has `block_public_acls = false` and a public-read bucket policy. Any file uploaded to the bucket is immediately public. Switching to OAC (mentioned above) would make the bucket private and only allow CloudFront to read it.
+**`skip_final_snapshot = true` and `deletion_protection = false`**
+`terraform destroy` would permanently delete the RDS instance and all data with no backup snapshot.
+*Fix*: Set both to production-safe values before going live.
 
 ---
 
-## Summary Table
+## Summary
 
-| Control | Status |
-|---------|--------|
-| HTTPS to visitors | ✅ Enforced via CloudFront |
-| HTTPS CloudFront → ALB | ❌ HTTP only (within AWS network) |
-| HTTPS ALB → ECS | ❌ HTTP only (within AWS network) |
-| HTTPS ECS → RDS | ❌ Not configured |
-| HTTPS ECS → Redis | ❌ Not configured |
-| Redis authentication | ❌ Not configured |
-| Private subnets for backend | ✅ ECS, RDS, Redis all private |
-| Security group least-privilege | ✅ Per-resource SG references |
-| Secrets in code or git | ✅ All in Secrets Manager |
-| HttpOnly JWT cookies | ✅ |
-| CSRF protection | ✅ SameSite=Lax + CSRF_TRUSTED_ORIGINS |
-| Default-deny authorisation | ✅ |
-| Refresh token rotation + blacklist | ✅ |
-| WAF | ❌ Not configured |
-| Rate limiting on login | ❌ Not configured |
-| Admin IP restriction | ❌ Publicly reachable |
-| Access token lifetime | ⚠️ 1 day (consider 15 min) |
-| ALLOWED_HOSTS | ⚠️ Wildcard |
-| GuardDuty | ❌ Not enabled |
-| CloudFront access logging | ❌ Not enabled |
+| Control | Status | Notes |
+|---|---|---|
+| TLS for visitors | ✅ | CloudFront + ACM cert, TLS 1.2+ |
+| TLS for ECS↔DB | ✅ | RDS Proxy `require_tls = true` |
+| TLS for ECS↔Redis | ❌ | Plaintext, no auth |
+| Network isolation | ✅ | Private subnets, security groups, no public IPs on ECS/RDS/Redis |
+| ALB locked to CloudFront | ❌ | ALB publicly reachable on port 80 |
+| API authentication | ✅ | JWT in HttpOnly cookies, default-deny |
+| CSRF protection | ✅ | Django default middleware |
+| Secrets management | ✅ | Secrets Manager, scoped IAM |
+| DB encryption at rest | ✅ | RDS `storage_encrypted = true` |
+| DB connection pooling | ✅ | RDS Proxy |
+| Admin auto-provisioned | ✅ | Secrets Manager, never hardcoded |
+| WAF | ❌ | Not configured |
+| Login rate limiting | ❌ | Not implemented |
+| Admin IP restriction | ❌ | Admin reachable from internet |
+| ALLOWED_HOSTS locked | ❌ | Currently `*` |
+| Short access token lifetime | ⚠️ | 1 day (recommended: 15 minutes) |
+| High availability | ⚠️ | Single task, single NAT Gateway |
+| DB deletion protection | ⚠️ | Disabled (fine for dev, not prod) |

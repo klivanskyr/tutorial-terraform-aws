@@ -23,7 +23,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 # os.environ.get() reads from environment variables injected by ECS.
 # The second argument is the fallback used when running locally.
-SECRET_KEY = os.environ.get('SECRET_KEY', 'django-insecure-u$k$a8w*egld_ty^&zfo!m$ihi#q^c*j-tb*%q@#sh8wrr8jfx')
+SECRET_KEY = os.environ.get('SECRET_KEY')
 
 # ECS injects DEBUG=False. Locally it falls back to True.
 DEBUG = os.environ.get('DEBUG', 'True') == 'True'

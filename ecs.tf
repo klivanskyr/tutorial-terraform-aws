@@ -168,7 +168,7 @@ resource "aws_ecs_task_definition" "django_api" {
         # using the task's private IP as the Host, not the domain name.
         # For production, replace with your domain and use a custom health check
         # host header on the ALB instead.
-        { name = "ALLOWED_HOSTS",   value = "*" },
+        { name = "ALLOWED_HOSTS",   value = "https://terraform-test.deepfeat.ai" },
         { name = "REDIS_URL",             value = "redis://${aws_elasticache_cluster.main.cache_nodes[0].address}:6379" },
         { name = "CSRF_TRUSTED_ORIGINS", value = "https://terraform-test.deepfeat.ai" },
       ]
