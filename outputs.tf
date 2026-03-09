@@ -1,3 +1,13 @@
+output "admin_credentials_secret" {
+  description = "Retrieve the admin password: aws secretsmanager get-secret-value --secret-id django-api/superuser-credentials --query SecretString --output text"
+  value       = aws_secretsmanager_secret.superuser.name
+}
+
+output "s3_bucket_name" {
+  description = "S3 bucket name — used by deploy.sh to sync static files"
+  value       = aws_s3_bucket.static_site.id
+}
+
 output "s3_website_endpoint" {
   description = "The raw S3 static website URL (HTTP only). CloudFront uses this as its origin."
   value       = aws_s3_bucket_website_configuration.static_site.website_endpoint

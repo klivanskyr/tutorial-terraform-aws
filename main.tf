@@ -2,6 +2,11 @@ provider "aws" {
   region = "us-west-1"
 }
 
+# The random provider generates random values (passwords, IDs, etc.) at
+# plan time. It has no AWS dependency — it's a pure Terraform utility.
+# We use it to generate a secure DB password so we never hardcode one.
+provider "random" {}
+
 # CloudFront is a global service but it can only use ACM certificates that
 # are created in us-east-1. This is an AWS hard requirement — it doesn't matter
 # where your bucket or distribution is. Terraform lets you define multiple
@@ -124,6 +129,78 @@ resource "aws_cloudfront_distribution" "static_site" {
       origin_protocol_policy = "http-only"
       origin_ssl_protocols   = ["TLSv1.2"]
     }
+  }
+
+  # Second origin: the ALB in front of ECS/Django.
+  # CloudFront connects to it over HTTP (port 80) — HTTPS is handled by
+  # CloudFront on the visitor side, so the CF→ALB leg stays within AWS's network.
+  origin {
+    domain_name = aws_lb.main.dns_name
+    origin_id   = "ALBDjangoAPI"
+
+    custom_origin_config {
+      http_port              = 80
+      https_port             = 443
+      origin_protocol_policy = "http-only"
+      origin_ssl_protocols   = ["TLSv1.2"]
+    }
+  }
+
+  # ordered_cache_behavior rules are evaluated top to bottom.
+  # The first match wins. This one catches all /api/* requests and
+  # sends them to Django instead of S3.
+  #
+  # Key differences from the static site behavior:
+  #   - All HTTP methods allowed (APIs need POST, PUT, DELETE, etc.)
+  #   - Query strings, headers, and cookies all forwarded (APIs need them)
+  #   - TTL = 0 everywhere (never cache API responses)
+  ordered_cache_behavior {
+    path_pattern     = "/api/*"
+    target_origin_id = "ALBDjangoAPI"
+
+    allowed_methods = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
+    cached_methods  = ["GET", "HEAD"]
+
+    viewer_protocol_policy = "redirect-to-https"
+
+    forwarded_values {
+      query_string = true
+      headers      = ["*"]  # Forward all headers (Authorization, Content-Type, etc.)
+      cookies {
+        forward = "all"
+      }
+    }
+
+    # Zero TTL = CloudFront never caches. Every request goes through to Django.
+    min_ttl     = 0
+    default_ttl = 0
+    max_ttl     = 0
+  }
+
+  # Route /admin/* to Django. Same pattern as /api/* — all methods, all cookies,
+  # all headers forwarded, zero caching. The two things that make admin special:
+  #   - Cookies: Django uses a session cookie (not JWT) for admin auth
+  #   - Headers: Django's CSRF checks the Referer header — it must be forwarded
+  ordered_cache_behavior {
+    path_pattern     = "/admin*"
+    target_origin_id = "ALBDjangoAPI"
+
+    allowed_methods = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
+    cached_methods  = ["GET", "HEAD"]
+
+    viewer_protocol_policy = "redirect-to-https"
+
+    forwarded_values {
+      query_string = true
+      headers      = ["*"]
+      cookies {
+        forward = "all"
+      }
+    }
+
+    min_ttl     = 0
+    default_ttl = 0
+    max_ttl     = 0
   }
 
   # Cache behaviors define how CloudFront handles requests.

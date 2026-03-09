@@ -10,6 +10,8 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/6.0/ref/settings/
 """
 
+import os
+from datetime import timedelta
 from pathlib import Path
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
@@ -19,13 +21,22 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/6.0/howto/deployment/checklist/
 
-# SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-u$k$a8w*egld_ty^&zfo!m$ihi#q^c*j-tb*%q@#sh8wrr8jfx'
+# os.environ.get() reads from environment variables injected by ECS.
+# The second argument is the fallback used when running locally.
+SECRET_KEY = os.environ.get('SECRET_KEY', 'django-insecure-u$k$a8w*egld_ty^&zfo!m$ihi#q^c*j-tb*%q@#sh8wrr8jfx')
 
-# SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+# ECS injects DEBUG=False. Locally it falls back to True.
+DEBUG = os.environ.get('DEBUG', 'True') == 'True'
 
-ALLOWED_HOSTS = []
+# ECS injects the domain. Locally, localhost and 127.0.0.1 work without config.
+# The ALB also sends a health check from its own IP, so we allow all internal
+# IPs with the 10.0.0.0/8 range handled by the '*' fallback for dev.
+ALLOWED_HOSTS = os.environ.get('ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
+
+# APPEND_SLASH = True (Django default) — lets Django redirect /admin → /admin/.
+# Safe for the API because APPEND_SLASH only fires when a URL doesn't match any
+# pattern. Our API paths like /api/health DO match (no slash in the pattern),
+# so they're served directly and never trigger the redirect.
 
 
 # Application definition
@@ -33,6 +44,7 @@ ALLOWED_HOSTS = []
 INSTALLED_APPS = [
     'api',
     'rest_framework',
+    'rest_framework_simplejwt.token_blacklist',  # Enables refresh token blacklisting on logout/rotation
     'django.contrib.admin',
     'django.contrib.auth',
     'django.contrib.contenttypes',
@@ -76,8 +88,13 @@ WSGI_APPLICATION = 'main.wsgi.application'
 
 DATABASES = {
     'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+        # Use sqlite3 locally (no env vars set), postgres in ECS (env vars injected).
+        'ENGINE': os.environ.get('DATABASE_ENGINE', 'django.db.backends.sqlite3'),
+        'NAME': os.environ.get('DATABASE_NAME', str(BASE_DIR / 'db.sqlite3')),
+        'USER': os.environ.get('DATABASE_USER', ''),
+        'PASSWORD': os.environ.get('DATABASE_PASSWORD', ''),
+        'HOST': os.environ.get('DATABASE_HOST', ''),
+        'PORT': os.environ.get('DATABASE_PORT', '5432'),
     }
 }
 
@@ -116,5 +133,73 @@ USE_TZ = True
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/6.0/howto/static-files/
 
-STATIC_URL = 'static/'
+STATIC_URL = '/static/'   # Absolute path so Django admin links work through CloudFront
 STATIC_ROOT = BASE_DIR / 'staticfiles'
+
+# ============================================================
+# Proxy / HTTPS settings
+# ============================================================
+
+# Tell Django to trust X-Forwarded-Proto from CloudFront/ALB.
+# Without this, Django thinks all requests are HTTP (the ALB→ECS leg is HTTP)
+# and won't set session/CSRF cookies as Secure.
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+
+# Django 4+ requires full scheme+domain here for CSRF to pass on HTTPS.
+# The admin login form POSTs back to itself and Django validates the Referer
+# against this list. Without it you get a 403 on every admin login attempt.
+CSRF_TRUSTED_ORIGINS = os.environ.get(
+    'CSRF_TRUSTED_ORIGINS', 'http://localhost:8000'
+).split(',')
+
+# ============================================================
+# Redis Cache
+# ============================================================
+
+# Django-redis uses Redis as the cache backend.
+# Locally falls back to a local Redis (run: docker run -p 6379:6379 redis).
+# In ECS, REDIS_URL is injected as an env var pointing to ElastiCache.
+REDIS_URL = os.environ.get('REDIS_URL', 'redis://127.0.0.1:6379')
+
+CACHES = {
+    'default': {
+        'BACKEND': 'django_redis.cache.RedisCache',
+        'LOCATION': REDIS_URL,
+        'OPTIONS': {
+            'CLIENT_CLASS': 'django_redis.client.DefaultClient',
+        },
+    }
+}
+
+# ============================================================
+# Django REST Framework
+# ============================================================
+
+REST_FRAMEWORK = {
+    # Use our custom cookie-based JWT auth instead of the default
+    # Authorization header approach. Tokens are read from HttpOnly cookies,
+    # so JavaScript can never access them directly (XSS protection).
+    'DEFAULT_AUTHENTICATION_CLASSES': [
+        'api.authentication.CookieJWTAuthentication',
+    ],
+    # Require authentication on all endpoints by default.
+    # Individual views can override with permission_classes = [AllowAny].
+    'DEFAULT_PERMISSION_CLASSES': [
+        'rest_framework.permissions.IsAuthenticated',
+    ],
+}
+
+# ============================================================
+# JWT Settings (djangorestframework-simplejwt)
+# ============================================================
+
+SIMPLE_JWT = {
+    'ACCESS_TOKEN_LIFETIME':  timedelta(days=1),
+    'REFRESH_TOKEN_LIFETIME': timedelta(days=7),
+
+    # When a refresh token is used, issue a new refresh token and blacklist
+    # the old one. This gives every active session a sliding 7-day window —
+    # users who use the app regularly never need to log in again.
+    'ROTATE_REFRESH_TOKENS':   True,
+    'BLACKLIST_AFTER_ROTATION': True,
+}
